@@ -1,11 +1,11 @@
 n_warehouse: 30
-idx_min: 1
+idx_min: 16
 idx_max: 20
 
 gamma_ratio_list: [0.1, 0.3, 0.5, 0.7, 0.9]
 
 EPS_CCG: 0.0001
-EPS_INEQUALITY: 0.000001 # for numerical stability
+EPS_INEQUALITY: 0.000001
 
 field_names: [
     'name',

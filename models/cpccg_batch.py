@@ -3,6 +3,7 @@ import gurobipy as gp
 import numpy as np
 import math
 import sys
+import time
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -39,19 +40,25 @@ def build_master(ins, g_work):
     x = {}
 
     for s in g_work.keys():
+        e = {}
         for i in range(ins.n_ware):
             for j in range(ins.n_dem):
                 for k in range(ins.n_com):
                     x[i, j, k, s] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'x_{i}_{j}_{k}_{s}')
         for j in range(ins.n_dem):
             for k in range(ins.n_com):
-                mp.addConstr(quicksum(x[i, j, k, s] for i in range(ins.n_ware)) >=
+                e[j, k] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'e_{j}_{k}_{s}')
+        for j in range(ins.n_dem):
+            for k in range(ins.n_com):
+                mp.addConstr(quicksum(x[i, j, k, s] for i in range(ins.n_ware)) + e[j, k] >=
                              ins.d[j, k] + ins.p[j, k] * g_work[s][j], name=f'xdem_{j}_{k}_{s}')
         for i in range(ins.n_ware):
             for k in range(ins.n_com):
                 mp.addConstr(quicksum(x[i, j, k, s] for j in range(ins.n_dem)) <= z[i, k], name=f'xcap_{i}_{k}_{s}')
         mp.addConstr(eta >= quicksum(ins.c[i, j, k] * x[i, j, k, s]
-                     for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com)), name=f'eta_{s}')
+                     for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com))
+                     + quicksum(math.ceil(ins.c.max()) * e[j, k] for j in range(ins.n_dem) for k in range(ins.n_com)),
+                     name=f'eta_{s}')
     mp.update()
 
     return mp, y, z, x, eta
@@ -60,7 +67,8 @@ def build_master(ins, g_work):
 def build_subproblem(ins, gamma_ratio):
     sp = gp.Model()
     sp.Params.OutputFlag = 0
-    B = math.ceil(ins.c.max()) # set to a reasonable value to mitigate numerical instability
+    sp.Params.MIPGap = 0
+    B = math.ceil(ins.c.max())
 
     g = {}
     lam = {}
@@ -118,6 +126,7 @@ def prune_scenes(ins, it, g_work, lam_cache, force_keep, prune_threshold, eps_in
 
     pa = gp.Model()
     pa.Params.OutputFlag = 0
+    pa.Params.MIPGap = 0
 
     keep = {}
     for s in candidate_sce:
@@ -178,66 +187,74 @@ def main():
                                   f'prune threshold = {prune_threshold}, stop prune ratio = {stop_prune_ratio}, '
                                   f'lb degradation tol = {lb_degradation_tol}')
                             print('=' * 60)
-    
-                            time_mp = 0
-                            time_pa = 0
-                            time_sp = 0
-                            time_total = 0
-    
+
+                            time_mp = 0.0
+                            time_pa = 0.0
+                            time_sp = 0.0
+                            time_total = 0.0
+
                             LB = -GRB.INFINITY
                             UB = GRB.INFINITY
                             LB_last_prune = -GRB.INFINITY
                             gap = 1
-    
+
                             g_work = {}  # working scenarios
                             g_cache = {}  # all scenarios
                             lam_cache = {}  # all dual directions
-    
+
                             it = 0
-    
+
                             mp, y, z, x, eta = build_master(ins, g_work)
                             sp, g, lam, pi, w = build_subproblem(ins, gamma_ratio)
-    
+
                             next_prune_it = prune_interval
                             prune_interval_dyn = prune_interval
                             prune_threshold_dyn = prune_threshold
                             y_new_val = None
                             z_new_val = None
                             n_rollback = 0
-    
+                            incumbent = None
+
                             while True:
                                 it += 1
-    
+
+                                tic = time.perf_counter()
                                 mp.optimize()
-                                time_mp += mp.Runtime
-                                time_total += mp.Runtime
-    
+                                time_mp += time.perf_counter() - tic
+
                                 LB = mp.ObjVal
-    
+
                                 y_val = np.array([y[i].X for i in range(ins.n_ware)])
                                 z_val = np.array([[z[i, k].X for k in range(ins.n_com)] for i in range(ins.n_ware)])
-    
-                                obj = quicksum(ins.d[j, k] * lam[j, k] for j in range(ins.n_dem) for k in range(ins.n_com))
-                                obj += quicksum(ins.p[j, k] * w[j, k] for j in range(ins.n_dem) for k in range(ins.n_com))
-                                obj -= quicksum(z_val[i, k] * pi[i, k] for i in range(ins.n_ware) for k in range(ins.n_com))
+
+                                obj = quicksum(ins.d[j, k] * lam[j, k] for j in range(ins.n_dem)
+                                               for k in range(ins.n_com))
+                                obj += quicksum(ins.p[j, k] * w[j, k] for j in range(ins.n_dem)
+                                                for k in range(ins.n_com))
+                                obj -= quicksum(z_val[i, k] * pi[i, k] for i in range(ins.n_ware)
+                                                for k in range(ins.n_com))
                                 sp.setObjective(obj, GRB.MAXIMIZE)
-    
+
                                 sp.update()
+                                tic = time.perf_counter()
                                 sp.optimize()
-                                time_sp += sp.Runtime
-                                time_total += sp.Runtime
-    
-                                UB = min(UB, mp.ObjVal - eta.X + sp.ObjVal)
+                                time_sp += time.perf_counter() - tic
+
+                                candidate = mp.ObjVal - eta.X + sp.ObjVal
+                                if candidate < UB:
+                                    UB = candidate
+                                    incumbent = (y_val.copy(), z_val.copy())
                                 gap = (UB - LB) / UB
-    
+
                                 g_opt = np.array([round(g[j].X) for j in range(ins.n_dem)])
                                 lam_opt = np.array([[lam[j, k].X for k in range(ins.n_com)] for j in range(ins.n_dem)])
-    
+
                                 g_work[it] = g_opt
                                 g_cache[it] = g_opt
-                                if it > 1: # The first iteration produces a trivial dual direction; discard it. Interested readers can print it
+                                if it > 1:  # The first iteration produces a trivial dual direction; discard it.
                                     lam_cache[it] = lam_opt
-    
+
+                                time_total = time_mp + time_pa + time_sp
                                 ni = int(mp.NumIntVars)
                                 nc = int(mp.NumVars - mp.NumIntVars)
                                 print(f'Iter {it}: U={UB:.0f}, L={LB:.0f}, gap={(UB-LB)/UB:.2%}, '
@@ -245,10 +262,12 @@ def main():
                                       f'time(T/M/P/S)={time_total:.0f}/{time_mp:.0f}/{time_pa:.0f}/{time_sp:.0f}, '
                                       f'MP#vars(I/C)={ni}/{nc}, '
                                       f'MP#cons={mp.NumConstrs}')
-    
+
                                 if gap <= EPS_CCG:
                                     break
-    
+
+                                tic = time.perf_counter()
+                                e = {}
                                 for i in range(ins.n_ware):
                                     for j in range(ins.n_dem):
                                         for k in range(ins.n_com):
@@ -256,40 +275,47 @@ def main():
                                                                        name=f'x_{i}_{j}_{k}_{it}')
                                 for j in range(ins.n_dem):
                                     for k in range(ins.n_com):
-                                        mp.addConstr(quicksum(x[i, j, k, it] for i in range(ins.n_ware))
+                                        e[j, k] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'e_{j}_{k}_{it}')
+                                for j in range(ins.n_dem):
+                                    for k in range(ins.n_com):
+                                        mp.addConstr(quicksum(x[i, j, k, it] for i in range(ins.n_ware)) + e[j, k]
                                                      >= ins.d[j, k] + ins.p[j, k] * g_opt[j], name=f'xdem_{j}_{k}_{it}')
                                 for i in range(ins.n_ware):
                                     for k in range(ins.n_com):
                                         mp.addConstr(quicksum(x[i, j, k, it] for j in range(
                                             ins.n_dem)) <= z[i, k], name=f'xcap_{i}_{k}_{it}')
                                 mp.addConstr(eta >= quicksum(ins.c[i, j, k] * x[i, j, k, it]
-                                             for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com)), name=f'eta_{it}')
+                                             for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com))
+                                             + quicksum(math.ceil(ins.c.max()) * e[j, k]
+                                                        for j in range(ins.n_dem) for k in range(ins.n_com)),
+                                             name=f'eta_{it}')
                                 mp.update()
-    
+                                time_mp += time.perf_counter() - tic
+
                                 # Try to prune
                                 if it == next_prune_it and gap > EPS_CCG * stop_prune_ratio:
+                                    tic = time.perf_counter()
                                     kept_sce, pruned_sce, pa_time = prune_scenes(
                                         ins, it, g_work, lam_cache, force_keep, prune_threshold_dyn, EPS_INEQUALITY)
-                                    time_pa += pa_time
-                                    time_total += pa_time
-    
+                                    time_pa += time.perf_counter() - tic
+
                                     g_work_new = {s: g_work[s] for s in kept_sce}
-    
+
+                                    tic = time.perf_counter()
                                     mp_new, y_new, z_new, x_new, eta_new = build_master(ins, g_work_new)
-    
+
                                     mp_new.optimize()
-                                    time_mp += mp_new.Runtime
-                                    time_total += mp_new.Runtime
-    
+                                    time_mp += time.perf_counter() - tic
+
                                     LB_new = mp_new.ObjVal
                                     gap_new = (UB - LB_new) / UB
-    
+
                                     y_new_val = np.array([y_new[i].X for i in range(ins.n_ware)])
                                     z_new_val = np.array([[z_new[i, k].X for k in range(ins.n_com)]
                                                          for i in range(ins.n_ware)])
-    
+
                                     print(f'  -> Prune: kept {len(kept_sce)}/{len(g_work)} scenarios')
-    
+
                                     if LB_new < LB_last_prune * (1 + EPS_INEQUALITY) or gap_new > gap * lb_degradation_tol:
                                         prune_interval_dyn += 2
                                         prune_threshold_dyn = min(prune_threshold_dyn +
@@ -301,16 +327,17 @@ def main():
                                         g_work = g_work_new
                                         mp, y, z, x, eta = mp_new, y_new, z_new, x_new, eta_new
                                         y_val, z_val = y_new_val, z_new_val
-                                        LB = LB_new                                        
+                                        LB = LB_new
                                         gap = gap_new
-                                        
+
                                     LB_last_prune = LB
                                     next_prune_it += prune_interval_dyn
-    
-                            y_sol = y_val.round().astype(int)
+
+                            y_inc, z_inc = incumbent
+                            y_sol = y_inc.round().astype(int)
                             opened = [i for i in range(ins.n_ware) if y_sol[i] == 1]
                             y_sol_str = ''.join(map(str, y_sol))
-    
+
                             print('=' * 60)
                             print('CP-C&CG Final Results')
                             print(f'Optimal value = {UB:.0f}')
@@ -320,7 +347,7 @@ def main():
                             print(f'Opened warehouses ({len(opened)}): {opened}')
                             print('=' * 60)
                             print()
-    
+
                             row = {
                                 'name': ins.name,
                                 'n_warehouse': ins.n_ware,
@@ -348,10 +375,10 @@ def main():
                                 'gap_abs': round(UB - LB, 3),
                                 'y_sol_str': y_sol_str,
                             }
-    
+
                             if not field_names:
                                 field_names = config['field_names']
-    
+
                             with open(csv_path, 'w' if not header_written else 'a', newline='') as f:
                                 writer = csv.DictWriter(f, fieldnames=field_names)
                                 if not header_written:

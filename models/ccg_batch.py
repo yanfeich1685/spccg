@@ -3,6 +3,7 @@ import gurobipy as gp
 import numpy as np
 import math
 import sys
+import time
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -45,14 +46,14 @@ def main():
             print('=' * 60)
             print(f'Original C&CG Start, {ins.name}, Gamma ratio = {gamma_ratio}')
             print('=' * 60)
-            
-            time_mp = 0
-            time_sp = 0
-            time_total = 0
+
+            time_mp = 0.0
+            time_sp = 0.0
+            time_total = 0.0
 
             LB = -GRB.INFINITY
             UB = GRB.INFINITY
-            
+
             scene_g_dict = {}
 
             it = 0
@@ -63,13 +64,10 @@ def main():
 
             y = {}
             z = {}
-            x = {}
             for i in range(ins.n_ware):
-                y[i] = mp.addVar(vtype=GRB.BINARY, name=f'y_{i}')                                   
+                y[i] = mp.addVar(vtype=GRB.BINARY, name=f'y_{i}')
                 for k in range(ins.n_com):
                     z[i, k] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'z_{i}_{k}')
-                    for j in range(ins.n_dem): 
-                        x[i, j, k, it] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'x_{i}_{j}_{k}_{it}')
             eta = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name='eta')
 
             mp.setObjective(
@@ -77,13 +75,14 @@ def main():
                 quicksum(ins.a[i, k] * z[i, k] for i in range(ins.n_ware) for k in range(ins.n_com)) + eta,
                 GRB.MINIMIZE
             )
-            
+
             for i in range(ins.n_ware):
                 mp.addConstr(quicksum(z[i, k] for k in range(ins.n_com)) <= ins.Z[i] * y[i])
             mp.update()
-            
+
             sp = gp.Model()
             sp.Params.OutputFlag = 0
+            sp.Params.MIPGap = 0
 
             g = {}
             lam = {}
@@ -96,7 +95,7 @@ def main():
                     w[j, k] = sp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'w_{j}_{k}')
             for i in range(ins.n_ware):
                 for k in range(ins.n_com):
-                    pi[i, k] = sp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'pi_{i}_{k}')            
+                    pi[i, k] = sp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'pi_{i}_{k}')
 
             sp.addConstr(quicksum(g[j] for j in range(ins.n_dem)) <= math.ceil(ins.n_dem * gamma_ratio))
             for i in range(ins.n_ware):
@@ -109,20 +108,21 @@ def main():
                     sp.addConstr(w[j, k] <= B * g[j])
                     sp.addConstr(w[j, k] >= lam[j, k] - B * (1 - g[j]))
                     sp.addConstr(lam[j, k] <= B)
-            sp.update()           
+            sp.update()
 
             x = {}
+            incumbent = None
 
             while True:
                 it += 1
-                
+
+                tic = time.perf_counter()
                 mp.optimize()
-                time_mp += mp.Runtime
-                time_total += mp.Runtime
+                time_mp += time.perf_counter() - tic
                 LB = mp.ObjVal
 
                 y_val = np.array([y[i].X for i in range(ins.n_ware)])
-                z_val = np.array([[z[i, k].X for k in range(ins.n_com)] for i in range(ins.n_ware)])                           
+                z_val = np.array([[z[i, k].X for k in range(ins.n_com)] for i in range(ins.n_ware)])
 
                 obj = quicksum(ins.d[j, k] * lam[j, k] for j in range(ins.n_dem) for k in range(ins.n_com))
                 obj += quicksum(ins.p[j, k] * w[j, k] for j in range(ins.n_dem) for k in range(ins.n_com))
@@ -130,41 +130,53 @@ def main():
                 sp.setObjective(obj, GRB.MAXIMIZE)
 
                 sp.update()
+                tic = time.perf_counter()
                 sp.optimize()
-                time_sp += sp.Runtime
-                time_total += sp.Runtime
+                time_sp += time.perf_counter() - tic
 
                 g_opt = np.array([round(g[j].X) for j in range(ins.n_dem)])
                 scene_g_dict[it] = g_opt
 
-                UB = min(UB, mp.ObjVal - eta.X + sp.ObjVal)
-                
+                candidate = mp.ObjVal - eta.X + sp.ObjVal
+                if candidate < UB:
+                    UB = candidate
+                    incumbent = (y_val.copy(), z_val.copy())
+
+                time_total = time_mp + time_sp
                 ni = int(mp.NumIntVars)
                 nc = int(mp.NumVars - mp.NumIntVars)
                 print(f'Iter {it}: U={UB:.0f}, L={LB:.0f}, gap={(UB-LB)/UB:.2%}, '
                       f'time(T/M/S)={time_total:.0f}/{time_mp:.0f}/{time_sp:.0f}, '
                       f'MP#vars(I/C)={ni}/{nc}, '
-                      f'MP#cons={mp.NumConstrs}')       
-                
+                      f'MP#cons={mp.NumConstrs}')
+
                 if (UB - LB) / UB <= EPS_CCG:
                     break
 
+                tic = time.perf_counter()
+                e = {}
                 for i in range(ins.n_ware):
                     for j in range(ins.n_dem):
                         for k in range(ins.n_com):
                             x[i, j, k, it] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'x_{i}_{j}_{k}_{it}')
                 for j in range(ins.n_dem):
                     for k in range(ins.n_com):
-                        mp.addConstr(quicksum(x[i, j, k, it] for i in range(ins.n_ware))
+                        e[j, k] = mp.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f'e_{j}_{k}_{it}')
+                for j in range(ins.n_dem):
+                    for k in range(ins.n_com):
+                        mp.addConstr(quicksum(x[i, j, k, it] for i in range(ins.n_ware)) + e[j, k]
                                      >= ins.d[j, k] + ins.p[j, k] * g_opt[j])
                 for i in range(ins.n_ware):
                     for k in range(ins.n_com):
                         mp.addConstr(quicksum(x[i, j, k, it] for j in range(ins.n_dem)) <= z[i, k])
                 mp.addConstr(eta >= quicksum(ins.c[i, j, k] * x[i, j, k, it]
-                             for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com)))
+                             for i in range(ins.n_ware) for j in range(ins.n_dem) for k in range(ins.n_com))
+                             + quicksum(B * e[j, k] for j in range(ins.n_dem) for k in range(ins.n_com)))
                 mp.update()
+                time_mp += time.perf_counter() - tic
 
-            y_sol = y_val.round().astype(int)
+            y_inc, z_inc = incumbent
+            y_sol = y_inc.round().astype(int)
             opened = [i for i in range(ins.n_ware) if y_sol[i] == 1]
             y_sol_str = ''.join(map(str, y_sol))
 
@@ -211,3 +223,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
