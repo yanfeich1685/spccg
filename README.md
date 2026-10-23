@@ -1,4 +1,4 @@
-# CP-C&CG
+# SP-C&CG
 
 Code for the paper
 "Exact scenario-pruned column-and-constraint generation for two-stage adaptive robust optimization"
